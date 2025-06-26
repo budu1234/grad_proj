@@ -80,3 +80,35 @@ def delete_task(task_id):
     cursor.close()
     conn.close()
     return jsonify({"message": "Task deleted"})
+
+@tasks_bp.route("/", methods=["POST"])
+@jwt_required()
+def create_task():
+    user_id = get_jwt_identity()
+    data = request.get_json()
+    name = data.get("name")
+    deadline = data.get("deadline")
+    importance = data.get("importance")
+    difficulty = data.get("difficulty")
+    status = data.get("status", "pending")
+    is_checked = data.get("is_checked", False)
+
+    if not all([name, deadline, importance, difficulty]):
+        return jsonify({"error": "Missing required fields"}), 400
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO tasks (user_id, name, deadline, importance, difficulty, status, is_checked) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+        (user_id, name, deadline, importance, difficulty, status, is_checked)
+    )
+    conn.commit()
+    task_id = cursor.lastrowid
+    cursor.close()
+    conn.close()
+
+    # --- Reschedule all tasks for this user ---
+    from routes.planner import recommend_reschedule_for_user
+    recommend_reschedule_for_user(user_id)
+
+    return jsonify({"message": "Task created and schedule updated", "task_id": task_id}), 201
