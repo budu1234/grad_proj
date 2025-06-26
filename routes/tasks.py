@@ -1,60 +1,82 @@
 from flask import Blueprint, jsonify, request
 from db import get_connection
-from models.AI_Personalization_Schedule_Planner_Core_Model import Task
+from flask_jwt_extended import jwt_required, get_jwt_identity
 
 tasks_bp = Blueprint('tasks', __name__)
 
 @tasks_bp.route("/", methods=["GET"])
+@jwt_required()
 def get_tasks():
+    user_id = get_jwt_identity()
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM Tasks")
+    cursor.execute("SELECT * FROM tasks WHERE user_id = %s", (user_id,))
     tasks = cursor.fetchall()
     cursor.close()
     conn.close()
     return jsonify(tasks)
 
-def find_task_by_id(task_id):
+@tasks_bp.route("/", methods=["POST"])
+@jwt_required()
+def create_task():
+    user_id = get_jwt_identity()
+    data = request.get_json()
+    name = data.get("name")
+    deadline = data.get("deadline")
+    importance = data.get("importance")
+    difficulty = data.get("difficulty")
+    status = data.get("status", "pending")
+    is_checked = data.get("is_checked", False)
+
+    if not all([name, deadline, importance, difficulty]):
+        return jsonify({"error": "Missing required fields"}), 400
+
     conn = get_connection()
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM Tasks WHERE task_id = %s", (task_id,))
-    row = cursor.fetchone()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO tasks (user_id, name, deadline, importance, difficulty, status, is_checked) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+        (user_id, name, deadline, importance, difficulty, status, is_checked)
+    )
+    conn.commit()
+    task_id = cursor.lastrowid
     cursor.close()
     conn.close()
-    if not row:
-        return None
-    # If you store checklist as JSON in the DB, load it here
-    checklist = row.get("checklist", [])
-    if isinstance(checklist, str):
-        import json
-        checklist = json.loads(checklist)
-    return Task(
-        task_id=row["task_id"],
-        name=row["name"],
-        deadline=row["deadline"],
-        importance=row["importance"],
-        difficulty=row["difficulty"],
-        checklist=checklist
+    return jsonify({"message": "Task created", "task_id": task_id}), 201
+
+@tasks_bp.route("/<int:task_id>", methods=["PATCH"])
+@jwt_required()
+def update_task(task_id):
+    user_id = get_jwt_identity()
+    data = request.get_json()
+    fields = []
+    values = []
+    for field in ["name", "deadline", "importance", "difficulty", "status", "is_checked"]:
+        if field in data:
+            fields.append(f"{field} = %s")
+            values.append(data[field])
+    if not fields:
+        return jsonify({"error": "No fields to update"}), 400
+    values.append(task_id)
+    values.append(user_id)
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        f"UPDATE tasks SET {', '.join(fields)} WHERE id = %s AND user_id = %s",
+        tuple(values)
     )
+    conn.commit()
+    cursor.close()
+    conn.close()
+    return jsonify({"message": "Task updated"})
 
-@tasks_bp.route('/<task_id>/checklist', methods=['POST'])
-def add_checklist_item(task_id):
-    data = request.get_json()
-    item_text = data.get('item')
-    # Find the task (implement your own task lookup)
-    task = find_task_by_id(task_id)
-    if not task:
-        return jsonify({"error": "Task not found"}), 404
-    task.checklist.append({"item": item_text, "done": False})
-    return jsonify({"message": "Checklist item added", "checklist": task.checklist})
-
-# Example: Mark checklist item as done
-@tasks_bp.route('/<task_id>/checklist/<int:item_index>', methods=['PATCH'])
-def mark_checklist_item(task_id, item_index):
-    data = request.get_json()
-    done = data.get('done', True)
-    task = find_task_by_id(task_id)
-    if not task or item_index >= len(task.checklist):
-        return jsonify({"error": "Task or checklist item not found"}), 404
-    task.checklist[item_index]['done'] = done
-    return jsonify({"message": "Checklist item updated", "checklist": task.checklist})
+@tasks_bp.route("/<int:task_id>", methods=["DELETE"])
+@jwt_required()
+def delete_task(task_id):
+    user_id = get_jwt_identity()
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM tasks WHERE id = %s AND user_id = %s", (task_id, user_id))
+    conn.commit()
+    cursor.close()
+    conn.close()
+    return jsonify({"message": "Task deleted"})
