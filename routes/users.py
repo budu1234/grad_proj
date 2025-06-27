@@ -73,12 +73,27 @@ def update_preferences():
     data = request.get_json()
     preferred_working_hours = data.get("preferred_working_hours")
     working_hours_constraint = data.get("working_hours_constraint")
+    buffer_hours = data.get("buffer_hours", 4)  # Default to 4 if not provided
+
+    if preferred_working_hours is None:
+        preferred_working_hours = [[d, 9, 17] for d in range(7)]
+    if working_hours_constraint is None:
+        working_hours_constraint = False
 
     conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT id FROM users WHERE id = %s", (user_id,))
+    user_row = cursor.fetchone()
+    if user_row is None:
+        cursor.close()
+        conn.close()
+        return jsonify({"error": "User not found"}), 404
+
+    cursor.close()
     cursor = conn.cursor()
     cursor.execute(
-        "UPDATE users SET preferred_working_hours=%s, breaks=%s, working_hours_constraint=%s WHERE id=%s",
-        (json.dumps(preferred_working_hours), working_hours_constraint, user_id)
+        "UPDATE users SET preferred_working_hours=%s, working_hours_constraint=%s, buffer_hours=%s WHERE id=%s",
+        (json.dumps(preferred_working_hours), working_hours_constraint, buffer_hours, user_id)
     )
     conn.commit()
     cursor.close()

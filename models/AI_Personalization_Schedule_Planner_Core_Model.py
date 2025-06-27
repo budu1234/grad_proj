@@ -317,9 +317,11 @@ def schedule_tasks(user, pending_tasks, available_time_slots):
 
 # --- Helper Function to Generate Contiguous Free Time Blocks (No Change) ---
 
-def generate_free_time_blocks(user, start_datetime, end_datetime, min_slot_duration_minutes=30):
+def generate_free_time_blocks(user, start_datetime, end_datetime, min_slot_duration_minutes=30, use_preferred_only=True):
     """
-    Generates contiguous blocks of free time based on user's preferred working hours and breaks.
+    Generates contiguous blocks of free time.
+    If use_preferred_only is True, only preferred working hours are considered.
+    If False, all hours are considered (except breaks).
     """
     free_blocks = []
     current_day = start_datetime.date()
@@ -327,13 +329,21 @@ def generate_free_time_blocks(user, start_datetime, end_datetime, min_slot_durat
     while current_day <= end_datetime.date():
         day_of_week = current_day.weekday()
 
-        daily_working_intervals = []
-        for pref_day, start_h, end_h in user.preferred_working_hours:
-            if pref_day == day_of_week:
-                daily_working_intervals.append((
-                    datetime(current_day.year, current_day.month, current_day.day, start_h, 0),
-                    datetime(current_day.year, current_day.month, current_day.day, end_h, 0)
-                ))
+        if use_preferred_only:
+            # Only preferred working hours
+            daily_working_intervals = []
+            for pref_day, start_h, end_h in user.preferred_working_hours:
+                if pref_day == day_of_week:
+                    daily_working_intervals.append((
+                        datetime(current_day.year, current_day.month, current_day.day, start_h, 0),
+                        datetime(current_day.year, current_day.month, current_day.day, end_h, 0)
+                    ))
+        else:
+            # All hours in the day (midnight to midnight)
+            daily_working_intervals = [(
+                datetime(current_day.year, current_day.month, current_day.day, 0, 0),
+                datetime(current_day.year, current_day.month, current_day.day, 23, 59)
+            )]
 
         daily_break_intervals = []
         for break_day, start_h, end_h in user.breaks:
