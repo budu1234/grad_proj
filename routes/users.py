@@ -1,11 +1,15 @@
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, current_app
+import os
 from db import get_connection
 import json
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity
+from flask_cors import CORS
+import requests
+import random
 
 users_bp = Blueprint('users', __name__)
-
+CORS(users_bp)
 @users_bp.route("/", methods=["GET"])
 @jwt_required()
 def get_users():
@@ -23,6 +27,7 @@ def register():
     username = data.get('username')
     password = data.get('password')
     email = data.get('email')
+    phone_number = data.get('phone_number')  # <-- NEW
     role = data.get('role', 'user')
 
     if not username or not password:
@@ -30,18 +35,26 @@ def register():
 
     password_hash = generate_password_hash(password)
     conn = get_connection()
-    cursor = conn.cursor()
+    cursor = conn.cursor(dictionary=True)
     try:
         cursor.execute(
-            "INSERT INTO users (username, password_hash, email, role) VALUES (%s, %s, %s, %s)",
-            (username, password_hash, email, role)
+            "INSERT INTO users (username, password_hash, email, role, phone_number) VALUES (%s, %s, %s, %s, %s)",
+            (username, password_hash, email, role, phone_number)
         )
         conn.commit()
-        return jsonify({'message': 'User registered successfully'}), 201
+        # Fetch the new user
+        cursor.execute("SELECT id, role FROM users WHERE email = %s", (email,))
+        user = cursor.fetchone()
+        if user:
+            access_token = create_access_token(identity=str(user['id']), additional_claims={"role": user['role']})
+            return jsonify({'message': 'User registered successfully', 'access_token': access_token}), 201
+        else:
+            return jsonify({'error': 'User registration failed'}), 400
     except Exception as e:
         return jsonify({'error': str(e)}), 400
     finally:
         cursor.close()
+        conn.close()
         conn.close()
 
 @users_bp.route("/login", methods=["POST"])
@@ -55,13 +68,14 @@ def login():
 
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM users WHERE username = %s", (username,))
+    # Allow login with username OR email
+    cursor.execute("SELECT * FROM users WHERE username = %s OR email = %s", (username, username))
     user = cursor.fetchone()
     cursor.close()
     conn.close()
 
     if user and check_password_hash(user['password_hash'], password):
-        access_token = create_access_token(identity=str(user['id']),additional_claims={"role": user['role']})
+        access_token = create_access_token(identity=str(user['id']), additional_claims={"role": user['role']})
         return jsonify({'access_token': access_token}), 200
     else:
         return jsonify({'error': 'Invalid username or password'}), 401
@@ -99,3 +113,182 @@ def update_preferences():
     cursor.close()
     conn.close()
     return jsonify({"message": "Preferences updated"})
+
+@users_bp.route("/login/google", methods=["POST"])
+def google_login():
+    data = request.get_json()
+    id_token = data.get("id_token")
+    if not id_token:
+        return jsonify({"error": "Missing id_token"}), 400
+
+    # Verify token with Google
+    google_resp = requests.get(
+        f"https://oauth2.googleapis.com/tokeninfo?id_token={id_token}"
+    )
+    if google_resp.status_code != 200:
+        return jsonify({"error": "Invalid Google token"}), 401
+
+    google_data = google_resp.json()
+    email = google_data.get("email")
+    if not email:
+        return jsonify({"error": "No email in Google token"}), 400
+
+    # Check if user exists, else create
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT * FROM users WHERE email = %s", (email,))
+    user = cursor.fetchone()
+    if not user:
+        # Register new user with Google email
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO users (username, email, role) VALUES (%s, %s, %s)",
+            (email, email, "user")
+        )
+        conn.commit()
+        cursor.execute("SELECT * FROM users WHERE email = %s", (email,))
+        user = cursor.fetchone()
+    cursor.close()
+    conn.close()
+
+    access_token = create_access_token(identity=str(user['id']), additional_claims={"role": user['role']})
+    return jsonify({'access_token': access_token}), 200
+
+@users_bp.route("/login/facebook", methods=["POST"])
+def facebook_login():
+    data = request.get_json()
+    access_token = data.get("access_token")
+    if not access_token:
+        return jsonify({"error": "Missing access_token"}), 400
+
+    # Verify token with Facebook
+    fb_resp = requests.get(
+        f"https://graph.facebook.com/me?fields=id,name,email&access_token={access_token}"
+    )
+    if fb_resp.status_code != 200:
+        return jsonify({"error": "Invalid Facebook token"}), 401
+
+    fb_data = fb_resp.json()
+    email = fb_data.get("email")
+    name = fb_data.get("name")
+    if not email:
+        return jsonify({"error": "No email in Facebook profile"}), 400
+
+    # Check if user exists, else create
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT * FROM users WHERE email = %s", (email,))
+    user = cursor.fetchone()
+    if not user:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO users (username, email, role) VALUES (%s, %s, %s)",
+            (name or email, email, "user")
+        )
+        conn.commit()
+        cursor.execute("SELECT * FROM users WHERE email = %s", (email,))
+        user = cursor.fetchone()
+    cursor.close()
+    conn.close()
+
+    access_token_jwt = create_access_token(identity=str(user['id']), additional_claims={"role": user['role']})
+    return jsonify({'access_token': access_token_jwt}), 200
+
+
+confirmation_codes = {}  # For demo only; use DB/Redis in production
+
+@users_bp.route("/send_confirmation_code", methods=["POST"])
+def send_confirmation_code():
+    data = request.get_json()
+    email = data.get("email")
+    if not email:
+        return jsonify({"error": "Email required"}), 400
+
+    code = str(random.randint(1000, 9999))
+    confirmation_codes[email] = code
+
+    # TODO: Send code via email/SMS here (for demo, just print)
+    print(f"Confirmation code for {email}: {code}")
+
+    return jsonify({"message": "Code sent"}), 200
+
+@users_bp.route("/verify_confirmation_code", methods=["POST"])
+def verify_confirmation_code():
+    data = request.get_json()
+    email = data.get("email")
+    code = data.get("code")
+    if not email or not code:
+        return jsonify({"error": "Email and code required"}), 400
+
+    if confirmation_codes.get(email) == code:
+        del confirmation_codes[email]
+        return jsonify({"message": "Code verified"}), 200
+    else:
+        return jsonify({"error": "Invalid code"}), 400
+    
+@users_bp.route("/me", methods=["GET"])
+@jwt_required()
+def get_me():
+    user_id = get_jwt_identity()
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT id, username, email, role, phone_number, profile_picture,preferred_working_hours, working_hours_constraint FROM users WHERE id = %s", (user_id,))
+    user = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    if user:
+        return jsonify(user), 200
+    else:
+        return jsonify({"error": "User not found"}), 404
+@users_bp.route("/reset_password", methods=["POST"])
+def reset_password():
+    data = request.get_json()
+    email = data.get("email")
+    code = data.get("code")
+    new_password = data.get("new_password")
+    if not email or not code or not new_password:
+        return jsonify({"error": "Email, code, and new password required"}), 400
+
+    # Check code
+    if confirmation_codes.get(email) != code:
+        return jsonify({"error": "Invalid code"}), 400
+
+    # Update password
+    conn = get_connection()
+    cursor = conn.cursor()
+    password_hash = generate_password_hash(new_password)
+    cursor.execute("UPDATE users SET password_hash=%s WHERE email=%s", (password_hash, email))
+    conn.commit()
+    cursor.close()
+    conn.close()
+    del confirmation_codes[email]
+    return jsonify({"message": "Password reset successful"}), 200
+
+@users_bp.route("/upload_profile_picture", methods=["POST"])
+@jwt_required()
+def upload_profile_picture():
+    user_id = get_jwt_identity()
+    if 'file' not in request.files:
+        return jsonify({"error": "No file part"}), 400
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({"error": "No selected file"}), 400
+
+    # Save file to static/profile_pics/
+    filename = f"user_{user_id}_{file.filename}"
+    save_path = os.path.join(current_app.root_path, "static", "profile_pics")
+    os.makedirs(save_path, exist_ok=True)
+    file_path = os.path.join(save_path, filename)
+    file.save(file_path)
+
+    # Save filename in DB
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET profile_picture=%s WHERE id=%s", (filename, user_id))
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    # Return the URL to the client
+    url = f"/static/profile_pics/{filename}"
+    return jsonify({"profile_picture_url": url}), 200

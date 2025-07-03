@@ -1,5 +1,6 @@
 from flask import Blueprint, jsonify, request
 from db import get_connection
+from routes.planner import recommend_reschedule_for_user  
 from flask_jwt_extended import jwt_required, get_jwt_identity
 
 schedule_bp = Blueprint('schedule', __name__)
@@ -10,11 +11,53 @@ def get_schedule():
     user_id = get_jwt_identity()
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM schedules WHERE user_id = %s", (user_id,))
-    schedule = cursor.fetchall()
+    # Get scheduled tasks
+    cursor.execute("""
+        SELECT 
+            s.id as schedule_id,
+            s.slot_start,
+            s.slot_end,
+            t.id as task_id,
+            t.name as task_name,
+            t.importance,
+            t.difficulty,
+            t.deadline,
+            t.status,
+            t.is_checked
+        FROM schedules s
+        JOIN tasks t ON s.task_id = t.id
+        WHERE s.user_id = %s
+        ORDER BY s.slot_start
+    """, (user_id,))
+    scheduled = cursor.fetchall()
+
+    # Get unscheduled tasks (tasks not in schedules)
+    cursor.execute("""
+        SELECT 
+            t.id as task_id,
+            t.name as task_name,
+            t.importance,
+            t.difficulty,
+            t.deadline,
+            t.status,
+            t.is_checked
+        FROM tasks t
+        WHERE t.user_id = %s
+        AND t.status = 'pending'
+        AND t.id NOT IN (SELECT task_id FROM schedules WHERE user_id = %s)
+    """, (user_id, user_id))
+    unscheduled = cursor.fetchall()
     cursor.close()
     conn.close()
-    return jsonify(schedule)
+
+    # Add a reason for each unscheduled task (you can make this smarter if you want)
+    for task in unscheduled:
+        task["reason"] = "No available slot before deadline or due to constraints"
+
+    return jsonify({
+        "scheduled": scheduled,
+        "unscheduled": unscheduled
+    }), 200
 
 @schedule_bp.route("/", methods=["POST"])
 @jwt_required()
@@ -77,3 +120,13 @@ def delete_schedule(schedule_id):
     cursor.close()
     conn.close()
     return jsonify({"message": "Schedule deleted"})
+
+@schedule_bp.route("/reschedule", methods=["POST"])
+@jwt_required()
+def reschedule_all():
+    user_id = get_jwt_identity()
+    try:
+        recommend_reschedule_for_user(user_id)
+        return jsonify({"message": "Rescheduling triggered"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500

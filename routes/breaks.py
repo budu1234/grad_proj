@@ -7,10 +7,16 @@ breaks_bp = Blueprint('breaks', __name__)
 @breaks_bp.route("/", methods=["GET"])
 @jwt_required()
 def get_breaks():
-    user = get_jwt_identity()
+    """
+    Get all breaks for the current user.
+    """
+    user_id = get_jwt_identity()
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT id, day_of_week, start_hour, end_hour FROM breaks WHERE user_id = %s", (user['id'],))
+    cursor.execute(
+        "SELECT id, day_of_week, start_hour, end_hour FROM breaks WHERE user_id = %s",
+        (user_id,)
+    )
     breaks = cursor.fetchall()
     cursor.close()
     conn.close()
@@ -19,7 +25,11 @@ def get_breaks():
 @breaks_bp.route("/", methods=["POST"])
 @jwt_required()
 def create_break():
-    user = get_jwt_identity()
+    """
+    Create a new break for the current user.
+    Expects JSON: { "day_of_week": int, "start_hour": int, "end_hour": int }
+    """
+    user_id = get_jwt_identity()
     data = request.get_json()
     day_of_week = data.get("day_of_week")
     start_hour = data.get("start_hour")
@@ -31,7 +41,7 @@ def create_break():
     cursor = conn.cursor()
     cursor.execute(
         "INSERT INTO breaks (user_id, day_of_week, start_hour, end_hour) VALUES (%s, %s, %s, %s)",
-        (user['id'], day_of_week, start_hour, end_hour)
+        (user_id, day_of_week, start_hour, end_hour)
     )
     conn.commit()
     break_id = cursor.lastrowid
@@ -42,7 +52,11 @@ def create_break():
 @breaks_bp.route("/<int:break_id>", methods=["PATCH"])
 @jwt_required()
 def update_break(break_id):
-    user = get_jwt_identity()
+    """
+    Update a break for the current user.
+    Expects JSON with any of: "day_of_week", "start_hour", "end_hour"
+    """
+    user_id = get_jwt_identity()
     data = request.get_json()
     fields = []
     values = []
@@ -53,7 +67,7 @@ def update_break(break_id):
     if not fields:
         return jsonify({"error": "No fields to update"}), 400
     values.append(break_id)
-    values.append(user['id'])
+    values.append(user_id)
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
@@ -68,10 +82,13 @@ def update_break(break_id):
 @breaks_bp.route("/<int:break_id>", methods=["DELETE"])
 @jwt_required()
 def delete_break(break_id):
-    user = get_jwt_identity()
+    """
+    Delete a break for the current user.
+    """
+    user_id = get_jwt_identity()
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM breaks WHERE id = %s AND user_id = %s", (break_id, user['id']))
+    cursor.execute("DELETE FROM breaks WHERE id = %s AND user_id = %s", (break_id, user_id))
     conn.commit()
     cursor.close()
     conn.close()

@@ -25,7 +25,8 @@ class User:
 
 class Task:
     """Represents a single task with its attributes."""
-    def __init__(self, task_id, name, deadline, importance, difficulty, checklist=None):
+    def __init__(self, task_id, name, deadline, importance, difficulty, checklist=None,
+                 day_of_week=None, start_hour=None, end_hour=None):
         self.task_id = task_id
         self.name = name
         self.deadline = deadline # datetime object
@@ -34,6 +35,9 @@ class Task:
         # Estimated duration based on difficulty (can be refined with ML in a real app)
         self.estimated_duration_hours = self._get_estimated_duration()
         self.checklist = checklist if checklist is not None else []  # List of dicts: [{"item": "Do research", "done": False}, ...]
+        self.day_of_week = day_of_week
+        self.start_hour = start_hour
+        self.end_hour = end_hour
     
     def check_working_constraints(self):
         return self.working_hours_constraint
@@ -274,6 +278,17 @@ def schedule_tasks(user, pending_tasks, available_time_slots):
             if slot_features['overlaps_break'] == 1:
                 prob += task_slot_vars[(task.task_id, i)] == 0, \
                         f"Task_{task.task_id}_Slot_{i}_NoBreakOverlap"
+    # 4. Enfore task working time constraints
+    for task in pending_tasks:
+        for i, (slot_start, slot_end) in enumerate(available_time_slots):
+            # If the task has a specific day_of_week, only allow assignment to that day
+            if task.day_of_week is not None and slot_start.weekday() != task.day_of_week:
+                prob += task_slot_vars[(task.task_id, i)] == 0, \
+                        f"Task_{task.task_id}_Slot_{i}_WrongDay"
+            # If the task has a specific start/end hour, only allow assignment within that window
+            if task.start_hour is not None and (slot_start.hour < task.start_hour or slot_end.hour > task.end_hour):
+                prob += task_slot_vars[(task.task_id, i)] == 0, \
+                        f"Task_{task.task_id}_Slot_{i}_WrongHour"
     if user.check_working_constraints():           
         for task in pending_tasks:
             for i, (slot_start, slot_end) in enumerate(available_time_slots):
@@ -283,6 +298,8 @@ def schedule_tasks(user, pending_tasks, available_time_slots):
                     # HARD CONSTRAINT: Do not allow task to be assigned to non-preferred hours
                     prob += task_slot_vars[(task.task_id, i)] == 0, \
                             f"Task_{task.task_id}_Slot_{i}_NoNonPreferred"
+    
+
 
     # Solve the problem
     prob.solve(PULP_CBC_CMD(msg=0))
