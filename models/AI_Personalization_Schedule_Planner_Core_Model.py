@@ -1,5 +1,5 @@
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone  
 import joblib
 from sklearn.linear_model import LinearRegression
 from sklearn.model_selection import train_test_split
@@ -12,15 +12,23 @@ from pulp import * # PuLP for linear programming optimization
 
 class User:
     """Represents a user with their scheduling preferences."""
-    def __init__(self, user_id, preferred_working_hours, breaks,working_hours=False):
+    def __init__(self, user_id, preferred_working_hours, breaks, working_hours=False,
+                general_start_hour=8, general_end_hour=22, scheduling_preference_mode=None):
         self.user_id = user_id
         # preferred_working_hours: List of tuples (day_of_week, start_hour, end_hour)
-        # e.g., [(0, 9, 17), (1, 10, 18)] for Monday 9-5, Tuesday 10-6
         self.preferred_working_hours = preferred_working_hours
-        self.working_hours_constraint=working_hours
+        self.working_hours_constraint = working_hours
         # breaks: List of tuples (day_of_week, start_hour, end_hour)
         self.breaks = breaks
+        self.general_start_hour = general_start_hour
+        self.general_end_hour = general_end_hour
+        # New: scheduling_preference_mode: 'preferred_only' or 'flexible_hours'
+        # If not provided, fallback to working_hours_constraint for backward compatibility
+        self.scheduling_preference_mode = scheduling_preference_mode or (
+            'preferred_only' if working_hours else 'flexible_hours'
+        )
     def check_working_constraints(self):
+        # For backward compatibility
         return self.working_hours_constraint
 
 class Task:
@@ -29,50 +37,58 @@ class Task:
                  day_of_week=None, start_hour=None, end_hour=None):
         self.task_id = task_id
         self.name = name
-        self.deadline = deadline # datetime object
+        # --- Timezone fix: always make deadline UTC-aware ---
+        if isinstance(deadline, str):
+            try:
+                self.deadline = datetime.strptime(deadline, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
+            except Exception:
+                self.deadline = datetime.fromisoformat(deadline).astimezone(timezone.utc)
+        elif isinstance(deadline, datetime):
+            if deadline.tzinfo is None:
+                self.deadline = deadline.replace(tzinfo=timezone.utc)
+            else:
+                self.deadline = deadline.astimezone(timezone.utc)
+        else:
+            self.deadline = deadline
+        # ----------------------------------------------------
         self.importance = importance # 'High', 'Medium', 'Low'
         self.difficulty = difficulty # 'High', 'Medium', 'Low'
-        # Estimated duration based on difficulty (can be refined with ML in a real app)
         self.estimated_duration_hours = self._get_estimated_duration()
-        self.checklist = checklist if checklist is not None else []  # List of dicts: [{"item": "Do research", "done": False}, ...]
+        self.checklist = checklist if checklist is not None else []
         self.day_of_week = day_of_week
         self.start_hour = start_hour
         self.end_hour = end_hour
-    
-    def check_working_constraints(self):
-        return self.working_hours_constraint
-
 
     def _get_estimated_duration(self):
-        """Maps difficulty to a default estimated duration in hours."""
         if self.difficulty == 'Low':
-            return 1.0 # 1 hour
+            return 1.0
         elif self.difficulty == 'Medium':
-            return 3.0 # 3 hours
+            return 3.0
         elif self.difficulty == 'High':
-            return 6.0 # 6 hours
-        return 0.0 # Default
+            return 6.0
+        return 0.0
 
 # --- 2. Feature Engineering (No Change) ---
 
 def generate_features(task, user, current_slot_start, current_slot_end):
-    """
-    Generates features for a (task, time slot) pair to feed into the ML model.
-    """
+    # --- Timezone fix: ensure UTC-aware ---
+    if current_slot_start.tzinfo is None:
+        current_slot_start = current_slot_start.replace(tzinfo=timezone.utc)
+    if current_slot_end.tzinfo is None:
+        current_slot_end = current_slot_end.replace(tzinfo=timezone.utc)
+    # ------------------------------------------------
     features = {
         'task_id': task.task_id,
         'user_id': user.user_id,
         'task_name': task.name,
         'current_slot_start_hour': current_slot_start.hour,
-        'current_slot_day_of_week': current_slot_start.weekday(), # Monday is 0, Sunday is 6
+        'current_slot_day_of_week': current_slot_start.weekday(),
         'slot_duration_hours': (current_slot_end - current_slot_start).total_seconds() / 3600,
         'time_until_deadline_hours': (task.deadline - current_slot_start).total_seconds() / 3600,
         'task_importance': task.importance,
         'task_difficulty': task.difficulty,
         'estimated_task_duration_hours': task.estimated_duration_hours,
     }
-
-    # Check if the slot is within user's preferred working hours
     is_preferred = False
     for day_of_week, start_hour, end_hour in user.preferred_working_hours:
         if (current_slot_start.weekday() == day_of_week and
@@ -81,20 +97,17 @@ def generate_features(task, user, current_slot_start, current_slot_end):
             is_preferred = True
             break
     features['is_preferred_working_hour'] = int(is_preferred)
-
-    # Check if the slot overlaps with breaks
     overlaps_break = False
     for day_of_week, break_start_hour, break_end_hour in user.breaks:
         if current_slot_start.weekday() == day_of_week:
             break_start = datetime(current_slot_start.year, current_slot_start.month,
-                                   current_slot_start.day, break_start_hour, 0)
+                                   current_slot_start.day, break_start_hour, 0, tzinfo=timezone.utc)
             break_end = datetime(current_slot_start.year, current_slot_start.month,
-                                 current_slot_start.day, break_end_hour, 0)
+                                 current_slot_start.day, break_end_hour, 0, tzinfo=timezone.utc)
             if not (current_slot_end <= break_start or current_slot_start >= break_end):
                 overlaps_break = True
                 break
     features['overlaps_break'] = int(overlaps_break)
-
     return features
 
 def train_suitability_model_from_csv(csv_path):
@@ -128,38 +141,26 @@ def train_suitability_model_from_csv(csv_path):
 
     return model_pipeline
 
-# --- 3. Suitability Scoring Model (Placeholder - No Change) ---
+# --- 3. Suitability Scoring Model (No Change) ---
 
 def train_dummy_suitability_model():
-    """
-    Trains a simple Linear Regression model for suitability scoring.
-    In a real application, this would be trained on real user data.
-    The 'suitability_score' would be a target variable representing how good a slot is.
-    (e.g., 1 for accepted, 0 for rejected, or based on task completion metrics).
-    """
     importance_map = {'Low': 1, 'Medium': 2, 'High': 3}
     difficulty_map = {'Low': 1, 'Medium': 2, 'High': 3}
-
     data = [
-        # Good examples (high score)
         {'time_until_deadline_hours': 72, 'slot_duration_hours': 3, 'estimated_task_duration_hours': 3, 'is_preferred_working_hour': 1, 'overlaps_break': 0, 'task_importance': 3, 'task_difficulty': 2, 'suitability_score': 0.9},
         {'time_until_deadline_hours': 24, 'slot_duration_hours': 2, 'estimated_task_duration_hours': 1, 'is_preferred_working_hour': 1, 'overlaps_break': 0, 'task_importance': 3, 'task_difficulty': 1, 'suitability_score': 0.95},
         {'time_until_deadline_hours': 168, 'slot_duration_hours': 6, 'estimated_task_duration_hours': 6, 'is_preferred_working_hour': 1, 'overlaps_break': 0, 'task_importance': 2, 'task_difficulty': 3, 'suitability_score': 0.8},
         {'time_until_deadline_hours': 48, 'slot_duration_hours': 1.5, 'estimated_task_duration_hours': 1, 'is_preferred_working_hour': 1, 'overlaps_break': 0, 'task_importance': 2, 'task_difficulty': 1, 'suitability_score': 0.85},
-        # Bad examples (low score)
         {'time_until_deadline_hours': 10, 'slot_duration_hours': 0.5, 'estimated_task_duration_hours': 3, 'is_preferred_working_hour': 0, 'overlaps_break': 1, 'task_importance': 3, 'task_difficulty': 2, 'suitability_score': 0.1},
         {'time_until_deadline_hours': 5, 'slot_duration_hours': 6, 'estimated_task_duration_hours': 1, 'is_preferred_working_hour': 0, 'overlaps_break': 0, 'task_importance': 1, 'task_difficulty': 1, 'suitability_score': 0.3},
-        {'time_until_deadline_hours': 200, 'slot_duration_hours': 1, 'estimated_task_duration_hours': 6, 'is_preferred_working_hour': 1, 'overlaps_break': 0, 'task_importance': 3, 'task_difficulty': 3, 'suitability_score': 0.4}, # Too long for slot
+        {'time_until_deadline_hours': 200, 'slot_duration_hours': 1, 'estimated_task_duration_hours': 6, 'is_preferred_working_hour': 1, 'overlaps_break': 0, 'task_importance': 3, 'task_difficulty': 3, 'suitability_score': 0.4},
         {'time_until_deadline_hours': 72, 'slot_duration_hours': 3, 'estimated_task_duration_hours': 3, 'is_preferred_working_hour': 0, 'overlaps_break': 0, 'task_importance': 1, 'task_difficulty': 1, 'suitability_score': 0.5},
     ]
-
     df = pd.DataFrame(data)
-
     numerical_features = ['time_until_deadline_hours', 'slot_duration_hours',
                           'estimated_task_duration_hours', 'is_preferred_working_hour',
                           'overlaps_break']
     categorical_features = ['task_importance', 'task_difficulty']
-
     preprocessor = ColumnTransformer(
         transformers=[
             ('num', StandardScaler(), numerical_features),
@@ -167,15 +168,11 @@ def train_dummy_suitability_model():
         ],
         remainder='passthrough'
     )
-
     model_pipeline = Pipeline(steps=[('preprocessor', preprocessor),
                                      ('regressor', LinearRegression())])
-
     X = df[numerical_features + categorical_features]
     y = df['suitability_score']
-
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-
     model_pipeline.fit(X_train, y_train)
     print("Dummy suitability model trained.")
     return model_pipeline
@@ -183,36 +180,26 @@ def train_dummy_suitability_model():
 suitability_model = joblib.load('suitability_model_checkpoint.pkl')
 
 def get_suitability_score(features_df):
-    """
-    Predicts the suitability score for a given set of features using the trained model.
-    """
     expected_cols = ['time_until_deadline_hours', 'slot_duration_hours',
                      'estimated_task_duration_hours', 'is_preferred_working_hour',
                      'overlaps_break', 'task_importance', 'task_difficulty']
-
     full_df = pd.DataFrame(columns=expected_cols)
     new_row = features_df.iloc[0].to_dict()
-
     importance_rev_map = {1: 'Low', 2: 'Medium', 3: 'High'}
     difficulty_rev_map = {1: 'Low', 2: 'Medium', 3: 'High'}
-
     if 'task_importance' in new_row and isinstance(new_row['task_importance'], int):
         new_row['task_importance'] = importance_rev_map.get(new_row['task_importance'], new_row['task_importance'])
     if 'task_difficulty' in new_row and isinstance(new_row['task_difficulty'], int):
         new_row['task_difficulty'] = difficulty_rev_map.get(new_row['task_difficulty'], new_row['task_difficulty'])
-
     temp_df = pd.DataFrame([new_row])
-
     for col in expected_cols:
         if col not in temp_df.columns:
             temp_df[col] = None
-
     temp_df = temp_df[expected_cols]
-
     score = suitability_model.predict(temp_df)[0]
-    return max(0.0, min(1.0, score)) # Ensure score is between 0 and 1
+    return max(0.0, min(1.0, score))
 
-# --- 4. Optimization Layer (MODIFIED FOR MULTI-TASKING WITH CAPACITY) ---
+# --- 4. Optimization Layer (Now with soft/hard constraint logic) ---
 
 def schedule_tasks(user, pending_tasks, available_time_slots):
     """
@@ -240,141 +227,120 @@ def schedule_tasks(user, pending_tasks, available_time_slots):
 
     # Store suitability scores for easy access
     scores = {}
+    # Determine scheduling mode
+    scheduling_mode = getattr(user, "scheduling_preference_mode", None)
+    if scheduling_mode is None:
+        scheduling_mode = 'preferred_only' if user.check_working_constraints() else 'flexible_hours'
+
     for task in pending_tasks:
         for i, (slot_start, slot_end) in enumerate(available_time_slots):
             # Tasks cannot be assigned if the slot ends after their deadline.
             if slot_end > task.deadline:
-                scores[(task.task_id, i)] = -1000000 # Strong penalty for assigning past deadline
+                scores[(task.task_id, i)] = -1000000
             else:
                 features = generate_features(task, user, slot_start, slot_end)
                 features_df = pd.DataFrame([features])
                 score = get_suitability_score(features_df)
+                # --- Soft/Hard constraint logic ---
+                if scheduling_mode == 'preferred_only':
+                    if features['is_preferred_working_hour'] == 0:
+                        # Hard exclusion
+                        score = -1000000
+                elif scheduling_mode == 'flexible_hours':
+                    if features['is_preferred_working_hour'] == 0:
+                        # Soft penalty (downscale score)
+                        score *= 0.5
                 scores[(task.task_id, i)] = score
-            
 
-    # Objective: Maximize the total suitability score of assigned tasks
-    # Re-checked and corrected: Ensure the generator expression is properly enclosed for lpSum.
     prob += lpSum([scores[(task.task_id, i)] * task_slot_vars[(task.task_id, i)]
                    for task in pending_tasks for i in range(len(available_time_slots))]), "Total Suitability Score"
 
     # Constraints:
-
-    # 1. EACH TASK IS ASSIGNED TO AT MOST ONE TIME SLOT (Allows tasks to be unscheduled)
     for task in pending_tasks:
         prob += lpSum(task_slot_vars[(task.task_id, i)] for i in range(len(available_time_slots))) <= 1, \
                 f"Task_{task.task_id}_One_Slot_Max"
 
-    # 2. SLOT CAPACITY CONSTRAINT (Crucial for multi-tasking)
-    # The sum of estimated durations of all tasks assigned to a slot must not exceed the slot's duration.
     for i, (slot_start, slot_end) in enumerate(available_time_slots):
         slot_duration = (slot_end - slot_start).total_seconds() / 3600
         prob += lpSum(task.estimated_duration_hours * task_slot_vars[(task.task_id, i)] for task in pending_tasks) <= slot_duration, \
                 f"Slot_{i}_Capacity"
 
-    # 3. DO NOT SCHEDULE TASKS IN BREAK TIMES (No Change)
     for task in pending_tasks:
         for i, (slot_start, slot_end) in enumerate(available_time_slots):
             slot_features = generate_features(task, user, slot_start, slot_end)
             if slot_features['overlaps_break'] == 1:
                 prob += task_slot_vars[(task.task_id, i)] == 0, \
                         f"Task_{task.task_id}_Slot_{i}_NoBreakOverlap"
-    # 4. Enfore task working time constraints
     for task in pending_tasks:
         for i, (slot_start, slot_end) in enumerate(available_time_slots):
-            # If the task has a specific day_of_week, only allow assignment to that day
             if task.day_of_week is not None and slot_start.weekday() != task.day_of_week:
                 prob += task_slot_vars[(task.task_id, i)] == 0, \
                         f"Task_{task.task_id}_Slot_{i}_WrongDay"
-            # If the task has a specific start/end hour, only allow assignment within that window
             if task.start_hour is not None and (slot_start.hour < task.start_hour or slot_end.hour > task.end_hour):
                 prob += task_slot_vars[(task.task_id, i)] == 0, \
                         f"Task_{task.task_id}_Slot_{i}_WrongHour"
-    if user.check_working_constraints():           
-        for task in pending_tasks:
-            for i, (slot_start, slot_end) in enumerate(available_time_slots):
-                slot_features = generate_features(task, user, slot_start, slot_end)
-                
-                if slot_features['is_preferred_working_hour'] == 0:
-                    # HARD CONSTRAINT: Do not allow task to be assigned to non-preferred hours
-                    prob += task_slot_vars[(task.task_id, i)] == 0, \
-                            f"Task_{task.task_id}_Slot_{i}_NoNonPreferred"
-    
 
+    # (No need for old hard constraint block, now handled above)
 
-    # Solve the problem
     prob.solve(PULP_CBC_CMD(msg=0))
 
-    # Extract results
     scheduled_tasks_by_slot = {i: [] for i in range(len(available_time_slots))}
     assigned_task_ids = set()
 
     if LpStatus[prob.status] == "Optimal":
         for task in pending_tasks:
             for i, (slot_start, slot_end) in enumerate(available_time_slots):
-                if task_slot_vars[(task.task_id, i)].varValue > 0.9: # If scheduled
+                if task_slot_vars[(task.task_id, i)].varValue > 0.9:
                     scheduled_tasks_by_slot[i].append(task)
                     assigned_task_ids.add(task.task_id)
-                    # Note: No 'break' here, as a task is assigned to only one slot (Task_One_Slot_Max ensures this)
-                    # but multiple tasks can go into the same slot.
-
-        # Prepare the final schedule output, mapping (start, end) tuples to lists of tasks
         final_schedule_output = {}
         for i, (slot_start, slot_end) in enumerate(available_time_slots):
-            if scheduled_tasks_by_slot[i]: # Only include slots that actually have tasks
+            if scheduled_tasks_by_slot[i]:
                 final_schedule_output[(slot_start, slot_end)] = scheduled_tasks_by_slot[i]
-
         unscheduled_tasks = [task for task in pending_tasks if task.task_id not in assigned_task_ids]
-
         return final_schedule_output, unscheduled_tasks
     else:
-        # If solver status is not 'Optimal', it means it couldn't find ANY solution.
-        # This is unlikely with the flexible 'Task_One_Slot_Max' constraint, but for robustness.
         print(f"Solver did not find an optimal solution. Status: {LpStatus[prob.status]}. All tasks considered unscheduled.")
         return {}, pending_tasks
 
 # --- Helper Function to Generate Contiguous Free Time Blocks (No Change) ---
 
 def generate_free_time_blocks(user, start_datetime, end_datetime, min_slot_duration_minutes=30, use_preferred_only=True):
-    """
-    Generates contiguous blocks of free time.
-    If use_preferred_only is True, only preferred working hours are considered.
-    If False, all hours are considered (except breaks).
-    """
     free_blocks = []
+    # --- Timezone fix: ensure UTC-aware ---
+    if start_datetime.tzinfo is None:
+        start_datetime = start_datetime.replace(tzinfo=timezone.utc)
+    if end_datetime.tzinfo is None:
+        end_datetime = end_datetime.replace(tzinfo=timezone.utc)
+    # ------------------------------------------------
     current_day = start_datetime.date()
-
     while current_day <= end_datetime.date():
         day_of_week = current_day.weekday()
-
+        general_start = datetime(current_day.year, current_day.month, current_day.day, user.general_start_hour, 0, tzinfo=timezone.utc)
+        general_end = datetime(current_day.year, current_day.month, current_day.day, user.general_end_hour, 0, tzinfo=timezone.utc)
         if use_preferred_only:
-            # Only preferred working hours
             daily_working_intervals = []
             for pref_day, start_h, end_h in user.preferred_working_hours:
                 if pref_day == day_of_week:
-                    daily_working_intervals.append((
-                        datetime(current_day.year, current_day.month, current_day.day, start_h, 0),
-                        datetime(current_day.year, current_day.month, current_day.day, end_h, 0)
-                    ))
+                    interval_start = max(datetime(current_day.year, current_day.month, current_day.day, start_h, 0, tzinfo=timezone.utc), general_start)
+                    interval_end = min(datetime(current_day.year, current_day.month, current_day.day, end_h, 0, tzinfo=timezone.utc), general_end)
+                    if interval_start < interval_end:
+                        daily_working_intervals.append((interval_start, interval_end))
         else:
-            # All hours in the day (midnight to midnight)
-            daily_working_intervals = [(
-                datetime(current_day.year, current_day.month, current_day.day, 0, 0),
-                datetime(current_day.year, current_day.month, current_day.day, 23, 59)
-            )]
-
+            if general_start < general_end:
+                daily_working_intervals = [(general_start, general_end)]
+            else:
+                daily_working_intervals = []
         daily_break_intervals = []
         for break_day, start_h, end_h in user.breaks:
             if break_day == day_of_week:
                 daily_break_intervals.append((
-                    datetime(current_day.year, current_day.month, current_day.day, start_h, 0),
-                    datetime(current_day.year, current_day.month, current_day.day, end_h, 0)
+                    datetime(current_day.year, current_day.month, current_day.day, start_h, 0, tzinfo=timezone.utc),
+                    datetime(current_day.year, current_day.month, current_day.day, end_h, 0, tzinfo=timezone.utc)
                 ))
-
         all_intervals = sorted(daily_working_intervals + daily_break_intervals)
-
         for work_start, work_end in daily_working_intervals:
             current_free_start = max(work_start, start_datetime)
-
             for break_start, break_end in daily_break_intervals:
                 if not (break_end <= current_free_start or break_start >= work_end):
                     if current_free_start < break_start:
@@ -382,21 +348,16 @@ def generate_free_time_blocks(user, start_datetime, end_datetime, min_slot_durat
                         if (block_end - current_free_start).total_seconds() / 60 >= min_slot_duration_minutes:
                             free_blocks.append((current_free_start, block_end))
                     current_free_start = max(current_free_start, break_end)
-
             if (work_end - current_free_start).total_seconds() / 60 >= min_slot_duration_minutes:
                 block_end = min(work_end, end_datetime)
                 if (block_end - current_free_start).total_seconds() / 60 >= min_slot_duration_minutes:
                     free_blocks.append((current_free_start, block_end))
-
         current_day += timedelta(days=1)
-
     if not free_blocks:
         return []
-
     free_blocks.sort(key=lambda x: x[0])
     merged_blocks = []
     current_merge_start, current_merge_end = free_blocks[0]
-
     for next_start, next_end in free_blocks[1:]:
         if next_start <= current_merge_end:
             current_merge_end = max(current_merge_end, next_end)
@@ -404,10 +365,9 @@ def generate_free_time_blocks(user, start_datetime, end_datetime, min_slot_durat
             merged_blocks.append((current_merge_start, current_merge_end))
             current_merge_start, current_merge_end = next_start, next_end
     merged_blocks.append((current_merge_start, current_merge_end))
-
     final_blocks = [(s, e) for s, e in merged_blocks if e > start_datetime and (e - s).total_seconds()/60 >= min_slot_duration_minutes]
-
     return final_blocks
+
 
 
 # --- Example Usage ---
@@ -431,7 +391,7 @@ if __name__ == "__main__":
         ]
     )
 
-    now = datetime(2025, 6, 16, 8, 12, 31) # Monday, June 16, 2025, 8:12 AM
+    now = datetime(2025, 6, 16, 8, 12, 31, tzinfo=timezone.utc) # Monday, June 16, 2025, 8:12 AM
 
     tasks_to_schedule = [
         Task(task_id="T001", name="Complete Project Proposal",

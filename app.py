@@ -8,11 +8,13 @@ from routes.breaks import breaks_bp
 from routes.notifications import notifications_bp
 import joblib
 from flask_jwt_extended import JWTManager
+from datetime import timedelta
 
 app = Flask(__name__)
 
 app.suitability_model = joblib.load('suitability_model_checkpoint.pkl')
 app.config['JWT_SECRET_KEY'] = 'your-secret-key'
+app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(hours=1)  # <-- Add
 jwt = JWTManager(app)
 
 # Register blueprints

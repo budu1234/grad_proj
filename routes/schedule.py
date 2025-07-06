@@ -2,6 +2,7 @@ from flask import Blueprint, jsonify, request
 from db import get_connection
 from routes.planner import recommend_reschedule_for_user  
 from flask_jwt_extended import jwt_required, get_jwt_identity
+from datetime import datetime, timezone
 
 schedule_bp = Blueprint('schedule', __name__)
 
@@ -27,9 +28,34 @@ def get_schedule():
         FROM schedules s
         JOIN tasks t ON s.task_id = t.id
         WHERE s.user_id = %s
+            AND t.status != 'completed'
         ORDER BY s.slot_start
     """, (user_id,))
     scheduled = cursor.fetchall()
+
+    # Mark overdue scheduled tasks
+    now = datetime.now(timezone.utc)
+    for task in scheduled:
+        deadline = task.get("deadline")
+        deadline_dt = None
+        if isinstance(deadline, str):
+            try:
+                deadline_dt = datetime.fromisoformat(deadline.replace("Z", "+00:00"))
+            except Exception:
+                deadline_dt = None
+        elif isinstance(deadline, datetime):
+            deadline_dt = deadline
+
+        # Make deadline_dt timezone-aware if it's naive
+        if deadline_dt is not None and deadline_dt.tzinfo is None:
+            deadline_dt = deadline_dt.replace(tzinfo=timezone.utc)
+
+        is_overdue = (
+            task["status"] != "completed"
+            and deadline_dt is not None
+            and deadline_dt < now
+        )
+        task["overdue"] = bool(is_overdue)
 
     # Get unscheduled tasks (tasks not in schedules)
     cursor.execute("""
@@ -50,9 +76,33 @@ def get_schedule():
     cursor.close()
     conn.close()
 
-    # Add a reason for each unscheduled task (you can make this smarter if you want)
+    # Mark overdue unscheduled tasks
     for task in unscheduled:
-        task["reason"] = "No available slot before deadline or due to constraints"
+        deadline = task.get("deadline")
+        deadline_dt = None
+        if isinstance(deadline, str):
+            try:
+                deadline_dt = datetime.fromisoformat(deadline.replace("Z", "+00:00"))
+            except Exception:
+                deadline_dt = None
+        elif isinstance(deadline, datetime):
+            deadline_dt = deadline
+
+        if deadline_dt is not None and deadline_dt.tzinfo is None:
+            deadline_dt = deadline_dt.replace(tzinfo=timezone.utc)
+
+        is_overdue = (
+            task["status"] != "completed"
+            and deadline_dt is not None
+            and deadline_dt < now
+        )
+        task["overdue"] = bool(is_overdue)
+
+        # Only set reason if NOT overdue
+        if not is_overdue:
+            task["reason"] = "No available slot before deadline or due to constraints"
+        else:
+            task["reason"] = ""  # Or remove this line to omit the field
 
     return jsonify({
         "scheduled": scheduled,
@@ -130,3 +180,32 @@ def reschedule_all():
         return jsonify({"message": "Rescheduling triggered"}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@schedule_bp.route("/completed", methods=["GET"])
+@jwt_required()
+def get_completed_tasks():
+    user_id = get_jwt_identity()
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("""
+        SELECT 
+            s.id as schedule_id,
+            s.slot_start,
+            s.slot_end,
+            t.id as task_id,
+            t.name as task_name,
+            t.importance,
+            t.difficulty,
+            t.deadline,
+            t.status,
+            t.is_checked
+        FROM schedules s
+        JOIN tasks t ON s.task_id = t.id
+        WHERE s.user_id = %s
+          AND t.status = 'completed'
+        ORDER BY s.slot_start
+    """, (user_id,))
+    completed = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return jsonify({"completed": completed}), 200

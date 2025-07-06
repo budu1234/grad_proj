@@ -31,35 +31,39 @@ def get_tasks():
 @tasks_bp.route("/<int:task_id>", methods=["PATCH"])
 @jwt_required()
 def update_task(task_id):
+    from datetime import datetime
+
+    def iso_to_mysql_datetime(iso_str):
+        if not isinstance(iso_str, str):
+            return iso_str
+        if iso_str.endswith('Z'):
+            iso_str = iso_str[:-1]
+        iso_str = iso_str.replace('T', ' ')
+        if '.' in iso_str:
+            iso_str = iso_str.split('.')[0]
+        return iso_str
+
     user_id = get_jwt_identity()
     data = request.get_json()
     fields = []
     values = []
     time_fields = ["day_of_week", "start_hour", "end_hour"]
-    time_updates = {field: data.get(field) for field in time_fields if field in data}
 
-    # If any time fields are being updated, fetch the current values for missing ones
-    if time_updates:
-        conn = get_connection()
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute("SELECT day_of_week, start_hour, end_hour FROM tasks WHERE id = %s AND user_id = %s", (task_id, user_id))
-        current = cursor.fetchone()
-        cursor.close()
-        conn.close()
-        if not current:
-            return jsonify({"error": "Task not found"}), 404
-        # Use updated values if provided, else current
-        day_of_week = time_updates.get("day_of_week", current["day_of_week"])
-        start_hour = time_updates.get("start_hour", current["start_hour"])
-        end_hour = time_updates.get("end_hour", current["end_hour"])
-        # Check for overlap
+    # Only check for overlap with breaks if ALL time fields are being updated
+    if all(field in data for field in time_fields):
+        day_of_week = data["day_of_week"]
+        start_hour = data["start_hour"]
+        end_hour = data["end_hour"]
         if is_overlapping_with_breaks(user_id, day_of_week, start_hour, end_hour):
             return jsonify({"error": "Task time overlaps with a break"}), 400
 
     for field in ["name", "deadline", "importance", "difficulty", "status", "is_checked", "day_of_week", "start_hour", "end_hour"]:
         if field in data:
+            value = data[field]
+            if field == "deadline" and value is not None:
+                value = iso_to_mysql_datetime(value)
             fields.append(f"{field} = %s")
-            values.append(data[field])
+            values.append(value)
     if not fields:
         return jsonify({"error": "No fields to update"}), 400
     values.append(task_id)
@@ -73,7 +77,12 @@ def update_task(task_id):
     conn.commit()
     cursor.close()
     conn.close()
-    return jsonify({"message": "Task updated"})
+
+    # --- Reschedule all tasks for this user ---
+    from routes.planner import recommend_reschedule_for_user
+    recommend_reschedule_for_user(user_id)
+
+    return jsonify({"message": "Task updated and schedule refreshed"})
 
 @tasks_bp.route("/<int:task_id>", methods=["DELETE"])
 @jwt_required()
@@ -88,11 +97,27 @@ def delete_task(task_id):
     conn.commit()
     cursor.close()
     conn.close()
-    return jsonify({"message": "Task deleted"})
+
+    # --- Reschedule all tasks for this user ---
+    from routes.planner import recommend_reschedule_for_user
+    recommend_reschedule_for_user(user_id)
+
+    return jsonify({"message": "Task deleted and schedule refreshed"})
 
 @tasks_bp.route("/", methods=["POST"])
 @jwt_required()
 def create_task():
+    from datetime import datetime
+
+    def iso_to_mysql_datetime(iso_str):
+        # Handle 'Z' (UTC) and milliseconds
+        if iso_str.endswith('Z'):
+            iso_str = iso_str[:-1]
+        iso_str = iso_str.replace('T', ' ')
+        if '.' in iso_str:
+            iso_str = iso_str.split('.')[0]
+        return iso_str
+
     user_id = get_jwt_identity()
     data = request.get_json()
     name = data.get("name")
@@ -101,29 +126,40 @@ def create_task():
     difficulty = data.get("difficulty")
     status = data.get("status", "pending")
     is_checked = data.get("is_checked", False)
+
+    # If you ever allow direct scheduling (with day_of_week), check for break overlap
     day_of_week = data.get("day_of_week")
     start_hour = data.get("start_hour")
     end_hour = data.get("end_hour")
+    if day_of_week is not None and start_hour is not None and end_hour is not None:
+        if is_overlapping_with_breaks(user_id, day_of_week, start_hour, end_hour):
+            return jsonify({"error": "Task time overlaps with a break"}), 400
 
-    if not all([name, deadline, importance, difficulty, day_of_week, start_hour, end_hour]):
+    # Do NOT require day_of_week, start_hour, end_hour
+    if not all([name, deadline, importance, difficulty]):
         return jsonify({"error": "Missing required fields"}), 400
-    
-    if is_overlapping_with_breaks(user_id, day_of_week, start_hour, end_hour):
-        return jsonify({"error": "Task time overlaps with a break"}), 400
+
+    # Convert deadline to MySQL DATETIME format
+    deadline_mysql = iso_to_mysql_datetime(deadline)
 
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO tasks (user_id, name, deadline, importance, difficulty, status, is_checked, day_of_week, start_hour, end_hour) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
-        (user_id, name, deadline, importance, difficulty, status, is_checked, day_of_week, start_hour, end_hour)
-    )
-    conn.commit()
-    task_id = cursor.lastrowid
-    cursor.close()
-    conn.close()
+    try:
+        cursor.execute(
+            "INSERT INTO tasks (user_id, name, deadline, importance, difficulty, status, is_checked) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            (user_id, name, deadline_mysql, importance, difficulty, status, is_checked)
+        )
+        task_id = cursor.lastrowid
 
-    # --- Reschedule all tasks for this user ---
-    from routes.planner import recommend_reschedule_for_user
-    recommend_reschedule_for_user(user_id)
+        # Try to generate schedule
+        from routes.planner import generate_schedule_for_user
+        schedule = generate_schedule_for_user(user_id)
 
-    return jsonify({"message": "Task created and schedule updated", "task_id": task_id}), 201
+        conn.commit()
+        return jsonify(schedule), 201
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": "Task not saved due to scheduling error", "details": str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
