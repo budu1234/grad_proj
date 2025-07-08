@@ -177,7 +177,7 @@ def train_dummy_suitability_model():
     print("Dummy suitability model trained.")
     return model_pipeline
 
-suitability_model = joblib.load('suitability_model_checkpoint.pkl')
+suitability_model = train_suitability_model_from_csv('suitability_training_data.csv')
 
 def get_suitability_score(features_df):
     expected_cols = ['time_until_deadline_hours', 'slot_duration_hours',
@@ -316,6 +316,12 @@ def generate_free_time_blocks(user, start_datetime, end_datetime, min_slot_durat
     current_day = start_datetime.date()
     while current_day <= end_datetime.date():
         day_of_week = current_day.weekday()
+        # --- Always skip days not in preferred_working_hours ---
+        preferred_days = [d for d, _, _ in user.preferred_working_hours]
+        if day_of_week not in preferred_days:
+            current_day += timedelta(days=1)
+            continue
+        # -------------------------------------------------------
         general_start = datetime(current_day.year, current_day.month, current_day.day, user.general_start_hour, 0, tzinfo=timezone.utc)
         general_end = datetime(current_day.year, current_day.month, current_day.day, user.general_end_hour, 0, tzinfo=timezone.utc)
         if use_preferred_only:
